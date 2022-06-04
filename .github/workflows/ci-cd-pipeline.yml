@@ -1,0 +1,100 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ none ]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: eu-central-1
+  AWS_ROLE_ARN: arn:aws:iam::<your-account-id>:role/<your-github-role>
+jobs:
+  registry:
+    runs-on: ubuntu-20.04
+    outputs:
+      repository-name: ${{ steps.create-registry.outputs.repository-name }}
+    steps:
+      - name: Check Out
+        uses: actions/checkout@v2
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Create ECR
+        id: create-registry
+        run: |
+          cd terraform/registry/
+
+          terraform init \
+          -backend-config=config/backend-config.tf \
+          -reconfigure \
+          -input=false
+          
+          terraform apply \
+          -var-file=vars.tfvars
+          -input=false \
+          -auto-approve 
+          
+          export REPOSITORY_NAME=$(terraform output --raw repository_name)
+          echo "::set-output name=repository-name::$REPOSITORY_NAME"
+
+  docker-build:
+    runs-on: ubuntu-20.04
+    needs: [registry]
+    env:
+      REPOSITORY_NAME: ${{ needs.registry.outputs.repository-name }}
+      ACCOUNT_ID: ${{ secrets.ACCOUNT_ID }}
+    steps:
+      - name: Check Out
+        uses: actions/checkout@v2
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Image build and push
+        id: docker-build
+        run: |
+          export IMAGE_TAG=$(git rev-parse --short HEAD)
+
+          export ACCOUNT_ID=$(aws sts get-caller-identity | jq -r .Account)
+          aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+          export REPOSITORY_URL=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${REPOSITORY_NAME}
+          
+          docker build --platform linux/amd64 -t ${REPOSITORY_NAME}:${IMAGE_TAG} .
+          docker tag ${REPOSITORY_NAME}:${IMAGE_TAG} ${REPOSITORY_URL}:${IMAGE_TAG}
+          docker push ${REPOSITORY_URL}:${IMAGE_TAG}
+
+  deploy-app:
+    runs-on: ubuntu-20.04
+    needs: [docker-build]
+    env:
+      REPOSITORY_NAME: ${{ needs.registry.outputs.repository-name }}
+      ACCOUNT_ID: ${{ secrets.ACCOUNT_ID }}
+    steps:
+      - name: Check Out
+        uses: actions/checkout@v2
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Deploy
+        id: terraform-deploy
+        run: |
+          cd terraform/deployment/
+          
+          terraform init \
+          -no-color \
+          -backend-config=config/backend-config.tf \
+          -reconfigure \
+          -input=false
+          
+          terraform apply \
+          -var-file=vars.tfvars \
+          -input=false \
+          -auto-approve
